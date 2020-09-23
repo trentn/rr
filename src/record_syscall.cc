@@ -3519,6 +3519,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case Arch::ADD_SEALS:
         case Arch::SET_RW_HINT:
         case Arch::SET_FILE_RW_HINT:
+        case Arch::GETLEASE:
           break;
 
         case Arch::SETFD:
