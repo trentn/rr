@@ -44,7 +44,7 @@ static CpuMicroarch compute_cpu_microarch() {
       return IntelSandyBridge;
     case 0x306A0:
       return IntelIvyBridge;
-    case 0x306C0:
+    case 0x306C0: /* Devil's Canyon */
     case 0x306F0:
     case 0x40650:
     case 0x40660:
@@ -74,16 +74,16 @@ static CpuMicroarch compute_cpu_microarch() {
 	return IntelCometlake;
     case 0x30f00:
       return AMDF15R30;
-    case 0x00f10:
+    case 0x00f10: // Naples, Whitehaven, Summit Ridge, Snowy Owl (Zen) (UNTESTED)
+    case 0x10f10: // Raven Ridge, Great Horned Owl (Zen) (UNTESTED)
+    case 0x10f80: // Banded Kestrel (Zen), Picasso (Zen+) (UNTESTED)
+    case 0x20f00: // Dali (Zen) (UNTESTED)
+    case 0x00f80: // Colfax, Pinnacle Ridge (Zen+) (UNTESTED)
+    case 0x30f10: // Rome, Castle Peak (Zen 2)
+    case 0x60f00: // Renoir (Zen 2) (UNTESTED)
+    case 0x70f10: // Matisse (Zen 2) (UNTESTED)
       if (ext_family == 8) {
-        if (!Flags::get().suppress_environment_warnings) {
-          fprintf(stderr, "You have a Ryzen CPU. The Ryzen "
-                          "retired-conditional-branches hardware\n"
-                          "performance counter is not accurate enough; rr will "
-                          "be unreliable.\n"
-                          "See https://github.com/mozilla/rr/issues/2034.\n");
-        }
-        return AMDRyzen;
+        return AMDZen;
       }
       break;
     default:
@@ -91,10 +91,7 @@ static CpuMicroarch compute_cpu_microarch() {
   }
 
   if (!strcmp(vendor, "AuthenticAMD")) {
-    CLEAN_FATAL()
-        << "AMD CPUs not supported.\n"
-        << "For Ryzen, see https://github.com/mozilla/rr/issues/2034.\n"
-        << "For post-Ryzen CPUs, please file a Github issue.";
+    CLEAN_FATAL() << "AMD CPU type " << HEX(cpu_type) << " unknown";
   } else {
     CLEAN_FATAL() << "Intel CPU type " << HEX(cpu_type) << " unknown";
   }
@@ -265,9 +262,44 @@ static void check_for_xen_pmi_bug() {
   }
 }
 
-static void check_for_arch_bugs() {
-  check_for_kvm_in_txcp_bug();
-  check_for_xen_pmi_bug();
+static void check_for_zen_speclockmap() {
+  // When the SpecLockMap optimization is not disabled, rr will not work
+  // reliably (e.g. it would work fine on a single process with a single
+  // thread, but not more). When the optimization is disabled, the
+  // perf counter for retired lock instructions of type SpecLockMapCommit
+  // (on PMC 0x25) stays at 0.
+  // See more details at https://github.com/mozilla/rr/issues/2034.
+  struct perf_event_attr attr;
+  // 0x25 == RETIRED_LOCK_INSTRUCTIONS - Counts the number of retired locked instructions
+  // + 0x08 == SPECLOCKMAPCOMMIT
+  init_perf_event_attr(&attr, PERF_TYPE_RAW, 0x510825);
+
+  ScopedFd fd = start_counter(0, -1, &attr);
+  if (fd.is_open()) {
+    int atomic = 0;
+    int64_t count = read_counter(fd);
+    // A lock add is known to increase the perf counter we're looking at.
+    asm volatile("lock addl $1, %0": "+m" (atomic));
+    if (read_counter(fd) == count) {
+      LOG(debug) << "SpecLockMap is disabled";
+    } else {
+      LOG(debug) << "SpecLockMap is not disabled";
+      fprintf(stderr,
+              "On Zen CPUs, rr will not work reliably unless you disable the "
+              "hardware SpecLockMap optimization.\nFor instructions on how to "
+              "do this, see https://github.com/mozilla/rr/wiki/Zen\n");
+    }
+  }
+}
+
+static void check_for_arch_bugs(CpuMicroarch uarch) {
+  if (uarch >= FirstIntel && uarch <= LastIntel) {
+    check_for_kvm_in_txcp_bug();
+    check_for_xen_pmi_bug();
+  }
+  if (uarch == AMDZen) {
+    check_for_zen_speclockmap();
+  }
 }
 
 static bool always_recreate_counters() {
@@ -290,30 +322,32 @@ static void arch_check_restricted_counter() {
 
 template <typename Arch>
 void PerfCounters::reset_arch_extras() {
-  struct perf_event_attr attr = rr::ticks_attr;
-  if (has_kvm_in_txcp_bug) {
-    // IN_TXCP isn't going to work reliably. Assume that HLE/RTM are not
-    // used,
-    // and check that.
-    attr.sample_period = 0;
-    attr.config |= IN_TX;
-    fd_ticks_in_transaction = start_counter(tid, fd_ticks_interrupt, &attr);
-  } else {
-    // Set up a separate counter for measuring ticks, which does not have
-    // a sample period and does not count events during aborted
-    // transactions.
-    // We have to use two separate counters here because the kernel does
-    // not support setting a sample_period with IN_TXCP, apparently for
-    // reasons related to this Intel note on IA32_PERFEVTSEL2:
-    // ``When IN_TXCP=1 & IN_TX=1 and in sampling, spurious PMI may
-    // occur and transactions may continuously abort near overflow
-    // conditions. Software should favor using IN_TXCP for counting over
-    // sampling. If sampling, software should use large “sample-after“
-    // value after clearing the counter configured to use IN_TXCP and
-    // also always reset the counter even when no overflow condition
-    // was reported.''
-    attr.sample_period = 0;
-    attr.config |= IN_TXCP;
-    fd_ticks_measure = start_counter(tid, fd_ticks_interrupt, &attr);
+  if (supports_txcp) {
+    struct perf_event_attr attr = rr::ticks_attr;
+    if (has_kvm_in_txcp_bug) {
+      // IN_TXCP isn't going to work reliably. Assume that HLE/RTM are not
+      // used,
+      // and check that.
+      attr.sample_period = 0;
+      attr.config |= IN_TX;
+      fd_ticks_in_transaction = start_counter(tid, fd_ticks_interrupt, &attr);
+    } else {
+      // Set up a separate counter for measuring ticks, which does not have
+      // a sample period and does not count events during aborted
+      // transactions.
+      // We have to use two separate counters here because the kernel does
+      // not support setting a sample_period with IN_TXCP, apparently for
+      // reasons related to this Intel note on IA32_PERFEVTSEL2:
+      // ``When IN_TXCP=1 & IN_TX=1 and in sampling, spurious PMI may
+      // occur and transactions may continuously abort near overflow
+      // conditions. Software should favor using IN_TXCP for counting over
+      // sampling. If sampling, software should use large “sample-after“
+      // value after clearing the counter configured to use IN_TXCP and
+      // also always reset the counter even when no overflow condition
+      // was reported.''
+      attr.sample_period = 0;
+      attr.config |= IN_TXCP;
+      fd_ticks_measure = start_counter(tid, fd_ticks_interrupt, &attr);
+    }
   }
 }

@@ -53,7 +53,8 @@ static bool activate_useless_counter;
  */
 enum CpuMicroarch {
   UnknownCpu,
-  IntelMerom,
+  FirstIntel,
+  IntelMerom = FirstIntel,
   IntelPenryn,
   IntelNehalem,
   IntelWestmere,
@@ -67,9 +68,14 @@ enum CpuMicroarch {
   IntelKabylake,
   IntelCometlake,
   IntelIcelake,
-  AMDF15R30,
-  AMDRyzen,
-  ARMNeoverseN1
+  LastIntel = IntelIcelake,
+  FirstAMD,
+  AMDF15R30 = FirstAMD,
+  AMDZen,
+  LastAMD = AMDZen,
+  FirstARM,
+  ARMNeoverseN1 = FirstARM,
+  LastARM = ARMNeoverseN1,
 };
 
 /*
@@ -87,11 +93,6 @@ enum CpuMicroarch {
  * performance.
  */
 #define PMU_BENEFITS_FROM_USELESS_COUNTER (1<<1)
-
-/*
- * Whether to skip the check for Intel CPU bugs
- */
-#define PMU_SKIP_INTEL_BUG_CHECK (1<<2)
 
 /*
  * Set if this CPU supports ticks counting all taken branches
@@ -136,15 +137,17 @@ static const PmuConfig pmu_configs[] = {
   { IntelWestmere, "Intel Westmere", 0x5101c4, 0, 0x50011d, 0, 100, PMU_TICKS_RCB },
   { IntelPenryn, "Intel Penryn", 0, 0, 0, 0, 100, 0 },
   { IntelMerom, "Intel Merom", 0, 0, 0, 0, 100, 0 },
-  { AMDF15R30, "AMD Family 15h Revision 30h", 0xc4, 0xc6, 0, 0, 250,
-    PMU_TICKS_TAKEN_BRANCHES | PMU_SKIP_INTEL_BUG_CHECK },
-  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0, 0, 0, 1000, PMU_TICKS_RCB },
+  { AMDF15R30, "AMD Family 15h Revision 30h", 0xc4, 0xc6, 0, 0, 250, PMU_TICKS_TAKEN_BRANCHES },
+  // 0xd1 == RETIRED_CONDITIONAL_BRANCH_INSTRUCTIONS - Number of retired conditional branch instructions
+  // 0x2c == INTERRUPT_TAKEN - Counts the number of interrupts taken
+  // Both counters are available on Zen, Zen+ and Zen2.
+  { AMDZen, "AMD Zen", 0x5100d1, 0, 0x51002c, 0, 10000, PMU_TICKS_RCB },
   // 0x21 == BR_RETIRED - Architecturally retired taken branches
   // 0x6F == STREX_SPEC - Speculatively executed strex instructions
   { ARMNeoverseN1, "ARM Neoverse N1", 0x21, 0, 0, 0x6F, 1000, PMU_TICKS_TAKEN_BRANCHES }
 };
 
-#define RR_SKID_MAX 1000
+#define RR_SKID_MAX 10000
 
 static string lowercase(const string& s) {
   string c = s;
@@ -298,7 +301,7 @@ static void check_working_counters() {
   }
 }
 
-static void check_for_bugs() {
+static void check_for_bugs(CpuMicroarch uarch) {
   if (running_under_rr()) {
     // Under rr we emulate idealized performance counters, so we can assume
     // none of the bugs apply.
@@ -306,8 +309,8 @@ static void check_for_bugs() {
   }
 
   check_for_ioc_period_bug();
-  check_for_arch_bugs();
   check_working_counters();
+  check_for_arch_bugs(uarch);
 }
 
 static CpuMicroarch get_cpu_microarch() {
@@ -369,9 +372,7 @@ static void init_attributes() {
     // same thing.  Unclear if necessary.
     hw_interrupts_attr.exclude_hv = 1;
 
-    if (!(pmu_flags & PMU_SKIP_INTEL_BUG_CHECK)) {
-      check_for_bugs();
-    }
+    check_for_bugs(uarch);
     /*
      * For maintainability, and since it doesn't impact performance when not
      * needed, we always activate this. If it ever turns out to be a problem,
